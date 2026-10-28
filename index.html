@@ -199,13 +199,13 @@ function setB(x,y,z,t){world.set(K(x,y,z),[x,y,z,t]);dirty.add(t);}
 function delB(x,y,z){const k=K(x,y,z),v=world.get(k);if(!v)return -1;world.delete(k);dirty.add(v[3]);return v[3];}
 const solid=(x,y,z)=>y<0||world.has(K(x,y,z));
 const PILES=[[-22,-14],[0,-28],[22,-14],[-18,16],[18,16]];
-function makePile(cx,cz,t){
+function makePile(cx,cz,t,put){put=put||setB;
   let n=0;
   for(let y=0;n<PILE;y++){
     const r=Math.max(.6,8.6-y*.68),cells=[];
     for(let dx=-9;dx<=9;dx++)for(let dz=-9;dz<=9;dz++){const d=Math.hypot(dx,dz)+rnd()*.9;if(d<=r)cells.push([d,dx,dz]);}
     cells.sort((a,b)=>a[0]-b[0]);
-    for(const c of cells){if(n>=PILE)break;setB(cx+c[1],y,cz+c[2],t);n++;}
+    for(const c of cells){if(n>=PILE)break;put(cx+c[1],y,cz+c[2],t);n++;}
   }
 }
 const P={pos:new THREE.Vector3(0,0,6),vel:new THREE.Vector3(),yaw:0,pitch:-.12,ground:false,fly:false};
@@ -342,6 +342,12 @@ const netEl=document.getElementById('net'),noteEl=document.getElementById('note'
 const nickIn=document.getElementById('nick'),codeIn=document.getElementById('code'),hostBtn=document.getElementById('host'),joinBtn=document.getElementById('join');
 const netBox=document.getElementById('netbox'),inviteBox=document.getElementById('invite'),inviteTxt=document.getElementById('invite-link'),copyBtn=document.getElementById('copy');
 let mode='solo',peer=null,code='',hostConn=null;const conns=new Map();
+const PEER_OPTS={debug:0,config:{iceServers:[
+  {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']},
+  {urls:'turn:openrelay.metered.ca:80',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443',username:'openrelayproject',credential:'openrelayproject'},
+  {urls:'turn:openrelay.metered.ca:443?transport=tcp',username:'openrelayproject',credential:'openrelayproject'}
+]}};
 const ID_PREFIX='klockowo-pl-';
 try{nickIn.value=localStorage.getItem(SK+'-nick')||'';}catch(e){}
 if(!nickIn.value)nickIn.value='Gracz'+(100+Math.floor(Math.random()*900));
@@ -368,10 +374,10 @@ function refreshNet(){
 function startHost(){
   if(typeof Peer==='undefined'){toast('Brak biblioteki sieciowej. Sprawdź internet.');return;}
   mode='starting';code=genCode();refreshNet();
-  peer=new Peer(ID_PREFIX+code);
+  peer=new Peer(ID_PREFIX+code,PEER_OPTS);
   peer.on('open',()=>{mode='host';try{history.replaceState(null,'','#'+code);}catch(e){}refreshNet();toast('Serwer działa. Kod: '+code);});
   peer.on('connection',c=>{
-    c.on('open',()=>{conns.set(c.peer,c);c.send({t:'init',w:worldFlat()});refreshNet();toast('Ktoś dołącza do gry');});
+    c.on('open',()=>{conns.set(c.peer,c);refreshNet();toast('Ktoś dołącza do gry');});
     c.on('data',d=>onHostData(c,d));
     const bye=()=>{if(!conns.has(c.peer))return;conns.delete(c.peer);dropAvatar(c.peer);refreshNet();};
     c.on('close',bye);c.on('error',bye);
@@ -385,6 +391,7 @@ function startHost(){
 function broadcast(msg,except){for(const c of conns.values())if(c.peer!==except&&c.open)c.send(msg);}
 function onHostData(c,d){
   if(!d||typeof d!=='object')return;
+  if(d.t==='hello'){if(!conns.has(c.peer)){conns.set(c.peer,c);refreshNet();}sendInit(c);return;}
   if(d.t==='pos'&&Array.isArray(d.p)){upAvatar(c.peer,String(d.n||'Gracz').slice(0,16),d.p);return;}
   if(d.t==='set'&&ints([d.x,d.y,d.z,d.v,d.was],5)){
     const {x,y,z,v,was}=d;if(Math.abs(x)>LIMIT||Math.abs(z)>LIMIT||y<0||y>60||v<-1||v>4)return;
@@ -407,24 +414,38 @@ function joinGame(c){
   if(typeof Peer==='undefined'){toast('Brak biblioteki sieciowej. Sprawdź internet.');return false;}
   if(changed)save();
   code=c;mode='joining';refreshNet();
-  peer=new Peer();
+  peer=new Peer(PEER_OPTS);
   peer.on('open',()=>{
-    hostConn=peer.connect(ID_PREFIX+code,{reliable:true});
-    hostConn.on('data',onClientData);
-    hostConn.on('close',lostHost);hostConn.on('error',lostHost);
+    connectHost();
   });
   peer.on('error',e=>{
-    if(e.type==='peer-unavailable')toast('Nie ma serwera o kodzie '+code+'.');
-    else toast('Błąd połączenia ('+e.type+').');
-    if(mode==='joining')backToSolo();
+    if(e.type==='peer-unavailable'){if(mode==='joining'){toast('Nie ma serwera o kodzie '+code+'. Sprawdź, czy host ma otwartą grę.');backToSolo();}}
+    else if(mode==='joining')netEl.innerHTML='<b>ŁĄCZENIE</b> · problem z siecią, próbuję dalej';
   });
-  setTimeout(()=>{if(mode==='joining'){toast('Serwer nie odpowiada. Sprawdź kod.');backToSolo();}},15000);
+  peer.on('disconnected',()=>{try{peer.reconnect();}catch(e){}});
+  const started=Date.now();
+  clearInterval(helloTimer);
+  helloTimer=setInterval(()=>{
+    if(mode!=='joining'){clearInterval(helloTimer);return;}
+    const s=(Date.now()-started)/1000;
+    if(s>45){clearInterval(helloTimer);toast('Nie udało się połączyć z serwerem '+code+'. Sprawdź kod albo spróbuj z innej sieci.');backToSolo();return;}
+    if(hostConn&&hostConn.open)sayHello();
+    else if(Date.now()-lastTry>12000){connectHost();}
+    if(s>8&&hostConn&&!hostConn.open){netEl.innerHTML='<b>ŁĄCZENIE</b> · próbuję dalej ('+Math.round(s)+' s)';}
+  },2500);
   return true;
 }
 function onClientData(d){
   if(!d||typeof d!=='object')return;
-  if(d.t==='init'&&Array.isArray(d.w)){
-    world.clear();for(let i=0;i+3<d.w.length;i+=4)if(ints(d.w.slice(i,i+4),4))setB(d.w[i],d.w[i+1],d.w[i+2],d.w[i+3]);
+  if(d.t==='init'&&Array.isArray(d.w)&&ints([d.part,d.total,d.id],3)){
+    if(mode!=='joining')return;
+    if(!initBuf||initBuf.id!==d.id)initBuf={id:d.id,parts:{},n:0};
+    if(!initBuf.parts[d.part]){initBuf.parts[d.part]=d.w;initBuf.n++;}
+    netEl.innerHTML='<b>ŁĄCZENIE</b> · pobieram świat '+initBuf.n+'/'+d.total;
+    if(initBuf.n<d.total)return;
+    world.clear();const B=baseWorld();for(const [k,t] of B){const a=k.split(',').map(Number);setB(a[0],a[1],a[2],t);}
+    for(let p=0;p<d.total;p++){const w=initBuf.parts[p];for(let i=0;i+3<w.length;i+=4){if(!ints(w.slice(i,i+4),4))continue;if(w[i+3]<0)delB(w[i],w[i+1],w[i+2]);else setB(w[i],w[i+1],w[i+2],w[i+3]);}}
+    initBuf=null;clearInterval(helloTimer);
     for(let i=0;i<5;i++)dirty.add(i);
     inv=[0,0,0,0,0];
     try{const s=JSON.parse(localStorage.getItem(SK+'-inv-'+code)||'null');if(s&&Array.isArray(s.inv))inv=s.inv.slice(0,5).map(n=>Math.max(0,n|0));}catch(e){}
@@ -456,6 +477,31 @@ function backToSolo(){
 }
 
 /* --- wspólne: zmiany klocków i pozycje --- */
+let BASE=null;
+function baseWorld(){if(!BASE){BASE=new Map();const keep=seed;seed=12345;PILES.forEach((p,i)=>makePile(p[0],p[1],i,(x,y,z,t)=>BASE.set(K(x,y,z),t)));seed=keep;}return BASE;}
+function worldDiff(){
+  const B=baseWorld(),out=[];
+  for(const [k,t] of B){const v=world.get(k);if(!v){const a=k.split(',').map(Number);out.push(a[0],a[1],a[2],-1);}else if(v[3]!==t)out.push(v[0],v[1],v[2],v[3]);}
+  for(const [k,v] of world)if(!B.has(k))out.push(v[0],v[1],v[2],v[3]);
+  return out;
+}
+let initSeq=0;
+function sendInit(c){
+  const diff=worldDiff(),per=2000,total=Math.max(1,Math.ceil(diff.length/per)),id=++initSeq;
+  for(let p=0;p<total;p++)c.send({t:'init',id,part:p,total,w:diff.slice(p*per,(p+1)*per)});
+}
+let helloTimer=0,initBuf=null,lastTry=0;
+function connectHost(){
+  if(!peer||peer.destroyed)return;
+  lastTry=Date.now();
+  try{if(hostConn)hostConn.close();}catch(e){}
+  const c=peer.connect(ID_PREFIX+code,{reliable:true,serialization:'json'});hostConn=c;
+  c.on('open',()=>{if(hostConn===c)sayHello();});
+  c.on('data',d=>{if(hostConn===c)onClientData(d);});
+  c.on('close',()=>{if(hostConn===c&&mode==='client')lostHost();});
+  c.on('error',()=>{if(hostConn===c&&mode==='client')lostHost();});
+}
+function sayHello(){if(hostConn&&hostConn.open)hostConn.send({t:'hello',n:nick()});}
 function netWrite(x,y,z,v,was){
   if(mode==='host')broadcast({t:'set',x,y,z,v});
   else if(mode==='client'&&hostConn&&hostConn.open)hostConn.send({t:'set',x,y,z,v,was});
